@@ -31,7 +31,7 @@
 #define MOTOR_LEFT_ENABLED
 #define MOTOR_RIGHT_ENABLED
 
-const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v6";
+const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v6q";
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #ifdef NANO
@@ -154,7 +154,7 @@ float        advanced_features_enable = 1.0;  // 1 = original advanced logic ena
 float        direct_pwm_mode          = 0.0;  // 1 = bypass target/PID and use direct duty commands
 float        direct_duty_left         = 0.0;  // -100..100 %, negative = reverse
 float        direct_duty_right        = 0.0;  // -100..100 %, negative = reverse
-float        serial_status_enable     = 1.0;  // 1 = periodic [STATUS] lines enabled
+float        serial_status_enable     = 0.0;  // 1 = periodic [STATUS] lines enabled
 
 // ── Serial command lookup table ───────────────────────────────────────────────
 struct CommandRef { float* varPtr; const char* label; };
