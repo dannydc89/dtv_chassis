@@ -31,7 +31,7 @@
 #define MOTOR_LEFT_ENABLED
 #define MOTOR_RIGHT_ENABLED
 
-const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v10";
+const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v11";
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #ifdef NANO
@@ -74,6 +74,9 @@ const float LOAD_FF_UP_RATE = 0.35f;          // Learn additional PWM when avera
 const float LOAD_FF_DOWN_RATE = 0.90f;        // Forget extra PWM when no longer needed
 const float LOAD_FF_IDLE_DECAY = 3.20f;       // Bleed learned assist away at low target speeds
 const float LOAD_FF_SYNC_GATE = 0.20f;        // Freeze learning if sync correction grows too large
+const float LOAD_FF_MISMATCH_PPS = 6.0f;      // Shared assist should not learn when only one wheel is lagging badly
+const float LOAD_FF_MISMATCH_RATIO = 0.14f;   // Relative wheel-speed spread that counts as a one-wheel disturbance
+const float LOAD_FF_MISMATCH_DECAY = 5.40f;   // Drop shared assist faster after a one-wheel brake is released
 
 // ── Auto-tuner settings ───────────────────────────────────────────────────────
 const int   TUNE_PWM_INIT   = 40;    // Initial open-loop PWM
@@ -585,10 +588,14 @@ void updateLoadFeedforward(bool advanced_on, bool direct_on, float dt) {
 
   int enabled_count = 0;
   float avg_speed_pps = 0.0f;
+  float min_speed_pps = 1.0e9f;
+  float max_speed_pps = 0.0f;
 
   #ifdef MOTOR_LEFT_ENABLED
     if (motorL.enabled) {
       avg_speed_pps += motorL.speed_pps;
+      min_speed_pps = min(min_speed_pps, motorL.speed_pps);
+      max_speed_pps = max(max_speed_pps, motorL.speed_pps);
       enabled_count++;
     }
   #endif
@@ -596,6 +603,8 @@ void updateLoadFeedforward(bool advanced_on, bool direct_on, float dt) {
   #ifdef MOTOR_RIGHT_ENABLED
     if (motorR.enabled) {
       avg_speed_pps += motorR.speed_pps;
+      min_speed_pps = min(min_speed_pps, motorR.speed_pps);
+      max_speed_pps = max(max_speed_pps, motorR.speed_pps);
       enabled_count++;
     }
   #endif
@@ -610,9 +619,12 @@ void updateLoadFeedforward(bool advanced_on, bool direct_on, float dt) {
   bool low_target = (target_pps < LOAD_FF_TARGET_MIN_PPS);
   bool sync_unstable = (abs(sync_out) > max(1.5f, target_pps * LOAD_FF_SYNC_GATE));
   bool startup_active = motorL.startup_boost_active || motorR.startup_boost_active;
+  float mismatch_gate = max(LOAD_FF_MISMATCH_PPS, target_pps * LOAD_FF_MISMATCH_RATIO);
+  bool wheel_mismatch = (enabled_count > 1) && ((max_speed_pps - min_speed_pps) > mismatch_gate);
 
-  if (low_target || startup_active || sync_unstable) {
-    load_ff_boost = max(0.0f, load_ff_boost - (LOAD_FF_IDLE_DECAY * dt));
+  if (low_target || startup_active || sync_unstable || wheel_mismatch) {
+    float decay_rate = wheel_mismatch ? LOAD_FF_MISMATCH_DECAY : LOAD_FF_IDLE_DECAY;
+    load_ff_boost = max(0.0f, load_ff_boost - (decay_rate * dt));
     return;
   }
 
