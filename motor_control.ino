@@ -31,7 +31,7 @@
 #define MOTOR_LEFT_ENABLED
 #define MOTOR_RIGHT_ENABLED
 
-const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v8";
+const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v10";
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #ifdef NANO
@@ -68,11 +68,12 @@ const float SPEED_FILTER_ALPHA = 0.35f;       // Low-pass filter for Hall-derive
 const float SYNC_CLAMP_RATIO = 0.8f;    // Sync can adjust target by at most 80%
 const float MAX_HALL_PPS     = 1000.0;  // Above this = noise/floating pin, filtered out
 const float STARTUP_SPEED_PPS = 1.5f;   // Below this speed the controller may need startup assist
-const float ADAPT_FF_TARGET_MIN_PPS = 18.0f;  // Learn extra drive only above this speed target
-const float ADAPT_FF_MAX = 12.0f;             // Max extra PWM learned for heavier load
-const float ADAPT_FF_UP_RATE = 0.55f;         // Learn additional PWM when staying below target
-const float ADAPT_FF_DOWN_RATE = 1.10f;       // Forget extra PWM faster when no longer needed
-const float ADAPT_FF_IDLE_DECAY = 3.20f;      // Bleed learned assist away at low target speeds
+const float LOAD_FF_TARGET_MIN_PPS = 18.0f;   // Learn extra drive only above this speed target
+const float LOAD_FF_MAX = 8.0f;               // Max extra PWM shared by both motors under load
+const float LOAD_FF_UP_RATE = 0.35f;          // Learn additional PWM when average speed stays below target
+const float LOAD_FF_DOWN_RATE = 0.90f;        // Forget extra PWM when no longer needed
+const float LOAD_FF_IDLE_DECAY = 3.20f;       // Bleed learned assist away at low target speeds
+const float LOAD_FF_SYNC_GATE = 0.20f;        // Freeze learning if sync correction grows too large
 
 // ── Auto-tuner settings ───────────────────────────────────────────────────────
 const int   TUNE_PWM_INIT   = 40;    // Initial open-loop PWM
@@ -118,7 +119,6 @@ struct Motor {
   // Feedforward offset — fixed PWM bias added on top of PID output
   // Use to compensate hardware asymmetry between motors
   float ff_offset;
-  float ff_adapt;
   int           startup_pwm_min;
   int           startup_pwm_boost;
   bool          startup_boost_active;
@@ -141,6 +141,7 @@ float target_pps    = 0;    // target converted to pps (internal unit)
 float target_ramped = 0;    // ramped target — increases gradually to avoid sudden start
 float ramp_rate     = 0.8;  // pps per loop (0 = disabled)
 float turn_offset   = 0.0;  // pps offset: positive = turn right, negative = turn left
+float load_ff_boost = 0.0;  // adaptive shared PWM boost for heavier load
 
 // ── Time tracking ─────────────────────────────────────────────────────────────
 float now_f, prvTime, dt;
@@ -192,6 +193,7 @@ void  applyPWM(Motor& m, float pid_out);
 void  applyDirectDuty(Motor& m, float duty_percent);
 void  stopMotor(Motor& m);
 void  resetMotor(Motor& m);
+void  updateLoadFeedforward(bool advanced_on, bool direct_on, float dt);
 bool  safetyCheck(Motor& m, float dt);
 void  emergencyStop(const __FlashStringHelper* reason);
 void  Plotter();
@@ -251,7 +253,6 @@ void setup() {
   motorL.accel_check_time = 0;
   motorL.prev_pwm         = 0;
   motorL.ff_offset        = 8;
-  motorL.ff_adapt         = 0;
   motorL.startup_pwm_min  = 12;
   motorL.startup_pwm_boost = 24;
   motorL.startup_boost_active = false;
@@ -276,7 +277,6 @@ void setup() {
   motorR.accel_check_time = 0;
   motorR.prev_pwm         = 0;
   motorR.ff_offset        = 10;
-  motorR.ff_adapt         = 0;
   motorR.startup_pwm_min  = 14;
   motorR.startup_pwm_boost = 32;
   motorR.startup_boost_active = false;
@@ -393,12 +393,14 @@ void loop() {
 
   // ── Assign per-motor targets ──
   if (!direct_on) {
-    motorL.target = max(target_pps + sync_out + turn_offset, 0.0f);
-    motorR.target = max(target_pps - sync_out - turn_offset, 0.0f);
+    motorL.target = max(target_pps - sync_out + turn_offset, 0.0f);
+    motorR.target = max(target_pps + sync_out - turn_offset, 0.0f);
   } else {
     motorL.target = 0;
     motorR.target = 0;
   }
+
+  updateLoadFeedforward(advanced_on, direct_on, dt);
 
   // ── Run control and apply outputs ──
   if (test_disable == 0) {
@@ -534,22 +536,6 @@ float runPID(Motor& m, float target, float dt) {
                          -PID_ERRSUM_LIMIT_SIMPLE, PID_ERRSUM_LIMIT_SIMPLE);
   }
 
-  if (advanced_on) {
-    bool adaptive_window = (target >= ADAPT_FF_TARGET_MIN_PPS &&
-                            !near_standstill &&
-                            !m.startup_boost_active);
-    if (adaptive_window) {
-      float adapt_err = constrain(err, -12.0f, 12.0f);
-      float adapt_rate = (adapt_err >= 0.0f) ? ADAPT_FF_UP_RATE : ADAPT_FF_DOWN_RATE;
-      m.ff_adapt = constrain(m.ff_adapt + (adapt_err * dt * adapt_rate),
-                             0.0f, ADAPT_FF_MAX);
-    } else if (m.ff_adapt > 0.0f) {
-      m.ff_adapt = max(0.0f, m.ff_adapt - (ADAPT_FF_IDLE_DECAY * dt));
-    }
-  } else {
-    m.ff_adapt = 0.0f;
-  }
-
   float I = m.ki * m.errSum;
 
   float D = 0;
@@ -591,6 +577,51 @@ float runSyncPID(float dt) {
 
 // ── Safety checks ─────────────────────────────────────────────────────────────
 // Returns false and triggers emergency stop if any limit is exceeded
+void updateLoadFeedforward(bool advanced_on, bool direct_on, float dt) {
+  if (!advanced_on || direct_on || emergency_active) {
+    load_ff_boost = 0.0f;
+    return;
+  }
+
+  int enabled_count = 0;
+  float avg_speed_pps = 0.0f;
+
+  #ifdef MOTOR_LEFT_ENABLED
+    if (motorL.enabled) {
+      avg_speed_pps += motorL.speed_pps;
+      enabled_count++;
+    }
+  #endif
+
+  #ifdef MOTOR_RIGHT_ENABLED
+    if (motorR.enabled) {
+      avg_speed_pps += motorR.speed_pps;
+      enabled_count++;
+    }
+  #endif
+
+  if (enabled_count <= 0) {
+    load_ff_boost = 0.0f;
+    return;
+  }
+
+  avg_speed_pps /= enabled_count;
+
+  bool low_target = (target_pps < LOAD_FF_TARGET_MIN_PPS);
+  bool sync_unstable = (abs(sync_out) > max(1.5f, target_pps * LOAD_FF_SYNC_GATE));
+  bool startup_active = motorL.startup_boost_active || motorR.startup_boost_active;
+
+  if (low_target || startup_active || sync_unstable) {
+    load_ff_boost = max(0.0f, load_ff_boost - (LOAD_FF_IDLE_DECAY * dt));
+    return;
+  }
+
+  float avg_err = constrain(target_pps - avg_speed_pps, -10.0f, 10.0f);
+  float adapt_rate = (avg_err >= 0.0f) ? LOAD_FF_UP_RATE : LOAD_FF_DOWN_RATE;
+  load_ff_boost = constrain(load_ff_boost + (avg_err * dt * adapt_rate),
+                            0.0f, LOAD_FF_MAX);
+}
+
 bool safetyCheck(Motor& m, float dt) {
   unsigned long now_ms = millis();
   bool startup_grace = m.startup_boost_active ||
@@ -669,7 +700,7 @@ void applyPWM(Motor& m, float pid_out) {
 
     // Use a brief startup kick only until the first Hall transitions appear.
     // After that, let PWM fall lower so the PID can hold slower speeds.
-    float pwm_base = pid_out + m.ff_offset + m.ff_adapt;
+    float pwm_base = pid_out + m.ff_offset + load_ff_boost;
     int pwm_floor = 0;
     if (near_standstill) {
       pwm_floor = m.startup_boost_active ? m.startup_pwm_boost : m.startup_pwm_min;
@@ -732,7 +763,6 @@ void resetMotor(Motor& m) {
   m.prevErr          = 0;
   m.pid_out          = 0;
   m.duty_cycle       = 0;
-  m.ff_adapt         = 0;
   m.speed_pps        = 0;
   m.speed_rpm        = 0;
   m.speed_ms         = 0;
@@ -766,6 +796,7 @@ void printStatusLine() {
   Serial.print(F(" mode="));         Serial.print(direct_pwm_mode != 0.0f ? F("DIRECT") : F("PID"));
   Serial.print(F(" adv="));          Serial.print(advanced_features_enable != 0.0f ? F("ON") : F("OFF"));
   Serial.print(F(" estop="));        Serial.print(emergency_active ? F("YES") : F("NO"));
+  Serial.print(F(" loadff="));       Serial.print(load_ff_boost, 1);
 
   #ifdef MOTOR_LEFT_ENABLED
     Serial.print(F(" | L[en="));   Serial.print(motorL.enabled ? F("1") : F("0"));
@@ -773,7 +804,6 @@ void printStatusLine() {
     Serial.print(F("pps rpm="));   Serial.print(motorL.speed_rpm, 1);
     Serial.print(F(" duty="));     Serial.print(motorL.duty_cycle, 1);
     Serial.print(F("% pid="));     Serial.print(motorL.pid_out, 1);
-    Serial.print(F(" ff="));       Serial.print(motorL.ff_adapt, 1);
     Serial.print(F(" inv="));      Serial.print(motorL.invert_dir ? F("1") : F("0"));
     Serial.print(F(" cnt="));      Serial.print(motorL.counter, 0);
     Serial.print(F("]"));
@@ -785,7 +815,6 @@ void printStatusLine() {
     Serial.print(F("pps rpm="));   Serial.print(motorR.speed_rpm, 1);
     Serial.print(F(" duty="));     Serial.print(motorR.duty_cycle, 1);
     Serial.print(F("% pid="));     Serial.print(motorR.pid_out, 1);
-    Serial.print(F(" ff="));       Serial.print(motorR.ff_adapt, 1);
     Serial.print(F(" inv="));      Serial.print(motorR.invert_dir ? F("1") : F("0"));
     Serial.print(F(" cnt="));      Serial.print(motorR.counter, 0);
     Serial.print(F("]"));
@@ -960,6 +989,7 @@ bool executeSerialCommand(char*& cursor) {
     direct_pwm_mode           = 0.0;
     direct_duty_left          = 0.0;
     direct_duty_right         = 0.0;
+    load_ff_boost             = 0.0;
     resetMotor(motorL);
     resetMotor(motorR);
     sync_errSum   = 0;
