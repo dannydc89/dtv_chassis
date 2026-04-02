@@ -31,7 +31,7 @@
 #define MOTOR_LEFT_ENABLED
 #define MOTOR_RIGHT_ENABLED
 
-const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v4";
+const char FIRMWARE_VERSION[] = "motor-control 2026-04-02 pid-v6";
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #ifdef NANO
@@ -154,6 +154,7 @@ float        advanced_features_enable = 1.0;  // 1 = original advanced logic ena
 float        direct_pwm_mode          = 0.0;  // 1 = bypass target/PID and use direct duty commands
 float        direct_duty_left         = 0.0;  // -100..100 %, negative = reverse
 float        direct_duty_right        = 0.0;  // -100..100 %, negative = reverse
+float        serial_status_enable     = 1.0;  // 1 = periodic [STATUS] lines enabled
 
 // ── Serial command lookup table ───────────────────────────────────────────────
 struct CommandRef { float* varPtr; const char* label; };
@@ -300,7 +301,7 @@ void setup() {
   Serial.println(F("Differential drive ready. SAFETY SYSTEM ACTIVE."));
   Serial.println(F("Units:   U0=pps  U1=RPM  U2=m/s"));
   Serial.println(F("Drive:   V=target  U=unit  O=turn  r=ramp  S=sync  R=reset"));
-  Serial.println(F("Debug:   A=advanced(0/1)  M=direct_pwm(0/1)  q/Q=left/right duty %"));
+  Serial.println(F("Debug:   A=advanced(0/1)  M=direct_pwm(0/1)  W=status(0/1)  q/Q=left/right duty %"));
   Serial.println(F("DirInv:  n=left(0/1)  N=right(0/1)"));
   Serial.println(F("Enable:  e=both(0/1)  EL=left(0/1)  ER=right(0/1)"));
   Serial.println(F("PID L:   p/i/d         PID R: P/I/D    Sync: x=Kp y=Ki"));
@@ -734,6 +735,7 @@ float convertToPPS(float v, int u) {
 void Plotter() {
   // Suppress during tuning — tuner prints its own data
   if (tune_state != TUNE_IDLE && tune_state != TUNE_DONE) return;
+  if (serial_status_enable == 0.0f) return;
 
   unsigned long now_ms = millis();
   if (now_ms - last_serial_report_ms < SERIAL_REPORT_INTERVAL_MS) return;
@@ -785,6 +787,7 @@ void initSerialCommands() {
   lut['S'].varPtr = &sync_enable;                lut['S'].label = "Sync_enable";
   lut['A'].varPtr = &advanced_features_enable;  lut['A'].label = "Advanced_features_enable";
   lut['M'].varPtr = &direct_pwm_mode;           lut['M'].label = "Direct_PWM_mode";
+  lut['W'].varPtr = &serial_status_enable;      lut['W'].label = "Status_output_enable";
   lut['x'].varPtr = &sync_kp;           lut['x'].label = "Sync_Kp";
   lut['y'].varPtr = &sync_ki;           lut['y'].label = "Sync_Ki";
   lut['p'].varPtr = &motorL.kp;         lut['p'].label = "Left_Kp";
@@ -1335,9 +1338,15 @@ void tunerComputeAndPrint() {
 
 // ── Abort tuning safely ───────────────────────────────────────────────────────
 void abortTuning() {
+  bool was_active = (tune_state != TUNE_IDLE && tune_state != TUNE_DONE);
   if (tune_motor) stopMotor(*tune_motor);
+  tune_motor      = nullptr;
+  tune_other      = nullptr;
+  tune_motor_name = nullptr;
   tune_state = TUNE_IDLE;
-  Serial.println(F("[TUNER ABORTED] Send TL/TR to retry or R to reset."));
+  if (was_active) {
+    Serial.println(F("[TUNER ABORTED] Send TL/TR to retry or R to reset."));
+  }
 }
 
 void handleSerialCommandStream() {
