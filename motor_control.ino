@@ -72,7 +72,7 @@ const float ADAPT_FF_TARGET_MIN_PPS = 18.0f;  // Learn extra drive only above th
 const float ADAPT_FF_MAX = 12.0f;             // Max extra PWM learned for heavier load
 const float ADAPT_FF_UP_RATE = 0.55f;         // Learn additional PWM when staying below target
 const float ADAPT_FF_DOWN_RATE = 1.10f;       // Forget extra PWM faster when no longer needed
-const float ADAPT_FF_IDLE_DECAY = 1.80f;      // Bleed learned assist away at low target speeds
+const float ADAPT_FF_IDLE_DECAY = 3.20f;      // Bleed learned assist away at low target speeds
 
 // ── Auto-tuner settings ───────────────────────────────────────────────────────
 const int   TUNE_PWM_INIT   = 40;    // Initial open-loop PWM
